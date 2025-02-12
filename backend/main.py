@@ -1,20 +1,26 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import List, Optional
 import openai
 import os
 import json
 from datetime import datetime
-from pathlib import Path
 from dotenv import load_dotenv
-from reportlab.lib import colors
+from pathlib import Path
+from models import (
+    ChatRequest, ChatResponse, OutlineRequest, 
+    ChapterContent, ResponseBreakdownRequest
+)
+from utils import (
+    validate_api_key, format_messages, create_chat_response,
+    log_gpt_interaction, save_outline, save_book,
+    calculate_chunk_size, generate_pdf,
+    BOOKS_DIR, LOGS_DIR
+)
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-import math
 
 # Load environment variables
 load_dotenv()
@@ -36,160 +42,6 @@ if not openai.api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-3.5-turbo")  # Default to GPT-3.5 if not specified
-
-# Configure data directories
-DATA_DIR = Path("data")
-OUTLINES_DIR = DATA_DIR / "outlines"
-BOOKS_DIR = DATA_DIR / "books"
-LOGS_DIR = DATA_DIR / "logs"
-
-# Ensure directories exist
-OUTLINES_DIR.mkdir(parents=True, exist_ok=True)
-BOOKS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate the cost of an API call based on the model and token usage"""
-    costs = {
-        "gpt-3.5-turbo": {
-            "input": 0.0015,   # $0.0015 per 1K input tokens
-            "output": 0.002    # $0.002 per 1K output tokens
-        },
-        "gpt-4": {
-            "input": 0.03,     # $0.03 per 1K input tokens
-            "output": 0.06     # $0.06 per 1K output tokens
-        }
-    }
-    
-    if model not in costs:
-        raise ValueError(f"Unknown model: {model}")
-        
-    model_costs = costs[model]
-    input_cost = (input_tokens / 1000) * model_costs["input"]
-    output_cost = (output_tokens / 1000) * model_costs["output"]
-    
-    return input_cost + output_cost
-
-def log_gpt_interaction(interaction_type: str, prompt: str, response: str, metadata: dict = None):
-    """Log GPT interaction to a JSON file"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Ensure metadata exists
-    metadata = metadata or {}
-    
-    # Add token counts and cost if available
-    if "input_tokens" in metadata and "output_tokens" in metadata:
-        try:
-            cost = calculate_cost(
-                metadata.get("model", GPT_MODEL),
-                metadata["input_tokens"],
-                metadata["output_tokens"]
-            )
-            metadata["cost_usd"] = round(cost, 6)
-            metadata["total_tokens"] = metadata["input_tokens"] + metadata["output_tokens"]
-        except Exception as e:
-            print(f"Error calculating cost: {str(e)}")
-    
-    log_entry = {
-        "timestamp": timestamp,
-        "type": interaction_type,
-        "prompt": prompt,
-        "response": response,
-        "metadata": metadata
-    }
-    
-    # Create a daily log file
-    date = datetime.now().strftime("%Y%m%d")
-    log_file = LOGS_DIR / f"gpt_interactions_{date}.json"
-    
-    # Read existing logs or create new list
-    if log_file.exists():
-        with open(log_file, 'r') as f:
-            try:
-                logs = json.load(f)
-            except json.JSONDecodeError:
-                logs = []
-    else:
-        logs = []
-    
-    # Append new log entry
-    logs.append(log_entry)
-    
-    # Write updated logs
-    with open(log_file, 'w') as f:
-        json.dump(logs, f, indent=2)
-
-class OutlineRequest(BaseModel):
-    prompt: str
-    pageCount: int
-
-class OutlineResponse(BaseModel):
-    chapters: List[dict]
-
-class ChapterContent(BaseModel):
-    chapter_id: int
-    content: str
-
-class ResponseBreakdownRequest(BaseModel):
-    chapter_title: str
-    content: str
-    sections: List[str]
-    total_word_count: int
-    response_word_limit: Optional[int] = None  # Make this optional
-
-def get_default_response_limit(model: str = "gpt-3.5-turbo") -> int:
-    """Get the default response word limit based on model token limits"""
-    # Model specific word limits (based on token limits, leaving room for prompt)
-    WORD_LIMITS = {
-        "gpt-3.5-turbo": 1000,  # ~3K tokens for response, 1K for prompt
-        "gpt-4": 2500,          # ~6K tokens for response, 2K for prompt
-    }
-    return WORD_LIMITS.get(model, WORD_LIMITS["gpt-3.5-turbo"])
-
-def save_outline(outline: str, page_count: int) -> str:
-    """Save the outline to a file and return the filename"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"outline_{timestamp}.json"
-    
-    data = {
-        "timestamp": timestamp,
-        "page_count": page_count,
-        "outline": outline
-    }
-    
-    filepath = OUTLINES_DIR / filename
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=2)
-    
-    return filename
-
-def save_book(chapters: List[dict], outline_filename: str) -> str:
-    """Save the generated book to a file and return the filename"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"book_{timestamp}.json"
-    
-    data = {
-        "timestamp": timestamp,
-        "outline_file": outline_filename,
-        "chapters": chapters
-    }
-    
-    filepath = BOOKS_DIR / filename
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=2)
-    
-    # Also save a text version for easy reading
-    text_filepath = BOOKS_DIR / f"book_{timestamp}.txt"
-    with open(text_filepath, 'w') as f:
-        for chapter in chapters:
-            f.write(f"{chapter['title']}\n\n")
-            f.write(f"{chapter['content']}\n\n")
-            if chapter.get('references'):
-                f.write("References:\n")
-                f.write(chapter['references'] + "\n\n")
-            f.write("=" * 80 + "\n\n")
-    
-    return filename
 
 @app.post("/api/generate-outline")
 async def generate_outline(request: OutlineRequest):
@@ -403,48 +255,6 @@ async def get_log(date: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def calculate_chunk_size(total_words: int, model: str = "gpt-3.5-turbo") -> tuple[int, int]:
-    """Calculate the optimal chunk size based on model token limits
-    Returns (words_per_chunk, num_chunks)"""
-    
-    # Model specific configurations
-    MODEL_CONFIGS = {
-        "gpt-3.5-turbo": {
-            "total_tokens": 4000,    # Total token limit
-            "reserved_tokens": 1000,  # Reserved for prompt, overhead
-            "words_per_token": 0.75,  # Approximate words per token
-            "max_words": 750         # (4000-1000) * 0.75 ≈ 750 words safe limit
-        },
-        "gpt-4": {
-            "total_tokens": 8000,
-            "reserved_tokens": 2000,
-            "words_per_token": 0.75,
-            "max_words": 1500        # (8000-2000) * 0.75 ≈ 1500 words safe limit
-        }
-    }
-    
-    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-3.5-turbo"])
-    
-    # Calculate number of chunks needed based on safe word limit
-    num_chunks = max(1, math.ceil(total_words / config["max_words"]))
-    
-    # Distribute words evenly across chunks, rounded up to nearest 10
-    words_per_chunk = math.ceil(total_words / num_chunks / 10) * 10
-    
-    # Verify we're within token limits
-    estimated_tokens = math.ceil(words_per_chunk / config["words_per_token"])
-    if estimated_tokens + config["reserved_tokens"] > config["total_tokens"]:
-        # If we exceed token limit, recalculate with one more chunk
-        num_chunks += 1
-        words_per_chunk = math.ceil(total_words / num_chunks / 10) * 10
-    
-    print(f"Chunk calculation for {model}:")
-    print(f"Total words: {total_words}")
-    print(f"Number of chunks: {num_chunks}")
-    print(f"Words per chunk: {words_per_chunk}")
-    print(f"Estimated tokens per chunk: {estimated_tokens}")
-    
-    return words_per_chunk, num_chunks
 
 @app.post("/api/break-into-responses")
 async def break_into_responses(request: ResponseBreakdownRequest):
@@ -652,79 +462,6 @@ Points to Cover:
             detail=f"An unexpected error occurred: {str(e)}"
         )
 
-def generate_pdf(book_data: dict, output_path: Path) -> Path:
-    """Generate a PDF version of the book"""
-    doc = SimpleDocTemplate(
-        str(output_path),
-        pagesize=letter,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=72
-    )
-    
-    # Create styles
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        spaceAfter=30
-    )
-    chapter_style = ParagraphStyle(
-        'ChapterTitle',
-        parent=styles['Heading2'],
-        fontSize=18,
-        spaceAfter=20
-    )
-    body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['Normal'],
-        fontSize=12,
-        leading=14,
-        spaceAfter=12
-    )
-    reference_style = ParagraphStyle(
-        'Reference',
-        parent=styles['Normal'],
-        fontSize=10,
-        leftIndent=20,
-        spaceAfter=6
-    )
-    
-    # Build the document
-    story = []
-    
-    # Add title
-    story.append(Paragraph("Software Engineering Handbook", title_style))
-    story.append(Spacer(1, 30))
-    
-    # Add chapters
-    for chapter in book_data["chapters"]:
-        # Chapter title
-        story.append(Paragraph(chapter["title"], chapter_style))
-        story.append(Spacer(1, 12))
-        
-        # Chapter content
-        content_paragraphs = chapter["content"].split('\n\n')
-        for para in content_paragraphs:
-            if para.strip():
-                story.append(Paragraph(para, body_style))
-        
-        # References section if present
-        if chapter.get("references"):
-            story.append(Spacer(1, 20))
-            story.append(Paragraph("References", styles["Heading3"]))
-            refs = chapter["references"].split('\n')
-            for ref in refs:
-                if ref.strip():
-                    story.append(Paragraph(ref, reference_style))
-        
-        story.append(Spacer(1, 30))
-    
-    # Build the PDF
-    doc.build(story)
-    return output_path
 
 @app.get("/api/download-book/{filename}")
 async def download_book(filename: str, format: str = "pdf"):
@@ -826,6 +563,22 @@ async def get_cost_summary(date: str):
             "model_usage": model_usage,
             "interaction_types": interaction_types
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat")
+async def chat(request: ChatRequest) -> ChatResponse:
+    if not validate_api_key():
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model=request.model,
+            messages=format_messages(request.messages),
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        )
+        return create_chat_response(response)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
